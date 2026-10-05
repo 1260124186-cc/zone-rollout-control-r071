@@ -19,10 +19,11 @@ type Store struct {
 	state domain.State
 }
 
-func Open(path string) (*Store, error) {
+func Open(path string, now time.Time) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("snapshot path is required")
 	}
+	now = now.UTC()
 	state := blankState()
 	payload, err := os.ReadFile(path)
 	switch {
@@ -31,6 +32,7 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("decode snapshot: %w", err)
 		}
 		state = normalize(state)
+		reconcileOnLoad(&state, now, path)
 	case errors.Is(err, os.ErrNotExist):
 		if err := replaceFile(path, state); err != nil {
 			return nil, fmt.Errorf("initialize snapshot: %w", err)
@@ -38,18 +40,19 @@ func Open(path string) (*Store, error) {
 	default:
 		return nil, fmt.Errorf("read snapshot: %w", err)
 	}
-	rebuildNodeClaims(&state)
 	return &Store{path: path, state: state}, nil
 }
 
-// rebuildNodeClaims merges the occupancy carried by live leases into the
-// persisted node claim set when a snapshot is loaded.
-func rebuildNodeClaims(state *domain.State) {
-	if state.NodeClaims == nil {
-		state.NodeClaims = make(map[string]domain.NodeClaim)
-	}
-	for nodeID, claim := range domain.BuildClaimsFromLeases(state.Leases) {
-		state.NodeClaims[nodeID] = claim
+// reconcileOnLoad re-derives occupancy from the actual lease facts in the
+// snapshot. Expired claimed leases are closed, occupancy left behind by
+// requests that were never accepted is discarded, and node states are
+// repaired to match the leases that genuinely still hold them.
+func reconcileOnLoad(state *domain.State, now time.Time, path string) {
+	domain.ReconcileOccupancy(state, now)
+	if err := replaceFile(path, state); err != nil {
+		// The in-memory view is already repaired, so the process can run, but
+		// losing the cleanup on disk would keep blocking nodes after a crash.
+		fmt.Fprintf(os.Stderr, "persist reconciled snapshot: %v\n", err)
 	}
 }
 

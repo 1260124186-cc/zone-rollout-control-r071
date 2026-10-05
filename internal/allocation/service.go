@@ -41,23 +41,13 @@ func (s *Service) Allocate(
 		return replayed, nil
 	}
 
-	claims, err := s.acquireClaims(ctx, planID, input, now)
-	if err != nil {
-		return domain.LeaseGroup{}, err
-	}
-
 	var group domain.LeaseGroup
 	err = s.store.Write(ctx, func(state *domain.State) error {
-		plan, ok := state.Plans[planID]
-		if !ok {
-			return domain.NotFound("plan", planID)
-		}
-		if plan.State != domain.PlanActive {
-			return domain.InvalidState("plan must be active for node leasing", map[string]any{
-				"plan_id": planID,
-				"state":   plan.State,
-			})
-		}
+		// Occupancy is reconciled strictly from lease facts before selection,
+		// so expiry and any occupancy left by rejected requests cannot block
+		// eligible nodes.
+		domain.ReconcileOccupancy(state, now)
+
 		if existingID, exists := state.LeaseRequestKeys[requestIndex]; exists {
 			existing, found := state.LeaseGroups[existingID]
 			if !found {
@@ -73,7 +63,27 @@ func (s *Service) Allocate(
 			group = existing
 			return nil
 		}
-		group = s.commitClaims(state, planID, input, fingerprint, claims, now)
+
+		candidates := selectCandidates(state, planID, input)
+		if len(candidates) == 0 {
+			return domain.NewError(domain.CodeNodeUnavailable, "no eligible node is ready", map[string]any{
+				"plan_id": planID,
+				"region":  input.Region,
+			})
+		}
+
+		plan, ok := state.Plans[planID]
+		if !ok {
+			return domain.NotFound("plan", planID)
+		}
+		if plan.State != domain.PlanActive {
+			return domain.InvalidState("plan must be active for node leasing", map[string]any{
+				"plan_id": planID,
+				"state":   plan.State,
+			})
+		}
+
+		group = s.commitLeases(state, planID, input, fingerprint, candidates, now)
 		return nil
 	})
 	return group, err
@@ -110,96 +120,72 @@ func (s *Service) replayGroup(
 	return group, found, err
 }
 
-// acquireClaims takes the occupancy for the nodes an allocation intends to use
-// before the lease group is committed.
-func (s *Service) acquireClaims(
-	ctx context.Context,
+// selectCandidates picks the ready, unoccupied nodes an allocation is allowed
+// to use in stable order. It only reads state; committing the nodes, leases
+// and lease group happens in the same transaction that ran this selection, so
+// a rejected request cannot leave occupancy behind.
+func selectCandidates(
+	state *domain.State,
 	planID string,
 	input domain.LeaseInput,
-	now time.Time,
-) ([]domain.NodeClaim, error) {
-	claims := make([]domain.NodeClaim, 0)
-	err := s.store.Write(ctx, func(state *domain.State) error {
-		expireLeases(state, now)
-		candidates := make([]domain.ResolverNode, 0)
-		for _, node := range state.Nodes {
-			if node.State != domain.NodeReady {
-				continue
-			}
-			if domain.NodeClaimBlocks(node.ID, state.NodeClaims) {
-				continue
-			}
-			if input.Region != "" && node.Region != input.Region {
-				continue
-			}
-			candidates = append(candidates, node)
+) []domain.ResolverNode {
+	candidates := make([]domain.ResolverNode, 0)
+	for _, node := range state.Nodes {
+		if node.State != domain.NodeReady {
+			continue
 		}
-		if len(candidates) == 0 {
-			return domain.NewError(domain.CodeNodeUnavailable, "no eligible node is ready", map[string]any{
-				"plan_id": planID,
-				"region":  input.Region,
-			})
+		if domain.NodeClaimBlocks(node.ID, state.NodeClaims) {
+			continue
 		}
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].Region != candidates[j].Region {
-				return candidates[i].Region < candidates[j].Region
-			}
-			return candidates[i].ID < candidates[j].ID
-		})
-		if len(candidates) > input.MaxNodes {
-			candidates = candidates[:input.MaxNodes]
+		if input.Region != "" && node.Region != input.Region {
+			continue
 		}
-		expiresAt := now.Add(time.Duration(input.LeaseSeconds) * time.Second)
-		for _, candidate := range candidates {
-			node := candidate
-			node.State = domain.NodeLeased
-			node.Version++
-			node.UpdatedAt = now
-			state.Nodes[node.ID] = node
-			leaseID := s.ids.New("lse")
-			claim := domain.NodeClaim{
-				NodeID:     node.ID,
-				PlanID:     planID,
-				RequestKey: input.RequestKey,
-				LeaseID:    leaseID,
-				ClaimedAt:  now,
-				ExpiresAt:  expiresAt,
-			}
-			state.NodeClaims[node.ID] = claim
-			claims = append(claims, claim)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		candidates = append(candidates, node)
 	}
-	return claims, nil
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Region != candidates[j].Region {
+			return candidates[i].Region < candidates[j].Region
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	if len(candidates) > input.MaxNodes {
+		candidates = candidates[:input.MaxNodes]
+	}
+	return candidates
 }
 
-// commitClaims turns acquired occupancy into the leases and lease group of one
-// allocation request.
-func (s *Service) commitClaims(
+// commitLeases turns the selected nodes into claimed leases and one lease
+// group. Node states and occupancy records are written together with the
+// leases, so the allocation either becomes fully visible or leaves no trace.
+func (s *Service) commitLeases(
 	state *domain.State,
 	planID string,
 	input domain.LeaseInput,
 	fingerprint string,
-	claims []domain.NodeClaim,
+	candidates []domain.ResolverNode,
 	now time.Time,
 ) domain.LeaseGroup {
 	groupID := s.ids.New("grp")
-	leaseIDs := make([]string, 0, len(claims))
-	for _, claim := range claims {
-		leaseIDs = append(leaseIDs, claim.LeaseID)
-		state.Leases[claim.LeaseID] = domain.NodeLease{
-			ID:           claim.LeaseID,
+	expiresAt := now.Add(time.Duration(input.LeaseSeconds) * time.Second)
+	leaseIDs := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		node := candidate
+		node.State = domain.NodeLeased
+		node.Version++
+		node.UpdatedAt = now
+		state.Nodes[node.ID] = node
+		leaseID := s.ids.New("lse")
+		state.Leases[leaseID] = domain.NodeLease{
+			ID:           leaseID,
 			PlanID:       planID,
-			NodeID:       claim.NodeID,
+			NodeID:       node.ID,
 			AllocationID: groupID,
 			State:        domain.LeaseClaimed,
-			ClaimedAt:    claim.ClaimedAt,
-			ExpiresAt:    claim.ExpiresAt,
+			ClaimedAt:    now,
+			ExpiresAt:    expiresAt,
 		}
-		state.NodeClaims[claim.NodeID] = claim
+		state.NodeClaims[node.ID] = domain.NodeClaimForLease(state.Leases[leaseID])
+		leaseIDs = append(leaseIDs, leaseID)
 	}
 	group := domain.LeaseGroup{
 		ID:                 groupID,
@@ -275,24 +261,16 @@ func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	return expired, err
 }
 
+// expireLeases ends every claimed lease past its deadline and fully releases
+// its node: lease state, node state and occupancy projection move together,
+// and any occupancy without a live lease is removed.
 func expireLeases(state *domain.State, now time.Time) int {
 	count := 0
-	for leaseID, lease := range state.Leases {
-		if lease.State != domain.LeaseClaimed || lease.ExpiresAt.After(now) {
-			continue
+	for _, lease := range state.Leases {
+		if lease.State == domain.LeaseClaimed && !lease.ExpiresAt.After(now) {
+			count++
 		}
-		finishedAt := now
-		lease.State = domain.LeaseExpired
-		lease.FinishedAt = &finishedAt
-		state.Leases[leaseID] = lease
-		if node, ok := state.Nodes[lease.NodeID]; ok && node.State == domain.NodeLeased {
-			node.State = domain.NodeReady
-			node.Version++
-			node.UpdatedAt = now
-			state.Nodes[node.ID] = node
-		}
-		delete(state.NodeClaims, lease.NodeID)
-		count++
 	}
+	domain.ReconcileOccupancy(state, now)
 	return count
 }

@@ -14,6 +14,7 @@ import (
 
 	"solo-0014-zone-rollout-control/internal/allocation"
 	"solo-0014-zone-rollout-control/internal/assessment"
+	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/fleet"
 	"solo-0014-zone-rollout-control/internal/httpapi"
 	"solo-0014-zone-rollout-control/internal/plan"
@@ -29,6 +30,32 @@ type harness struct {
 	server   *http.Server
 	listener net.Listener
 	tempDir  string
+	backing  *backing
+}
+
+type backing struct {
+	store       *store.Store
+	plans       *plan.Service
+	nodes       *fleet.Service
+	allocations *allocation.Service
+	probes      *probe.Service
+	assessments *assessment.Service
+}
+
+func newBacking(statePath string, clock platform.Clock) (*backing, error) {
+	stateStore, err := store.Open(statePath, clock.Now())
+	if err != nil {
+		return nil, err
+	}
+	ids := platform.CryptoIDGenerator{}
+	return &backing{
+		store:       stateStore,
+		plans:       plan.New(stateStore, clock, ids),
+		nodes:       fleet.New(stateStore, clock, ids),
+		allocations: allocation.New(stateStore, clock, ids),
+		probes:      probe.New(stateStore, clock, ids, allocation.New(stateStore, clock, ids)),
+		assessments: assessment.New(stateStore, clock, ids),
+	}, nil
 }
 
 func newHarness() (*harness, error) {
@@ -36,20 +63,14 @@ func newHarness() (*harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temporary directory: %w", err)
 	}
-	stateStore, err := store.Open(tempDir + "/state.json")
+	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
+	services, err := newBacking(tempDir+"/state.json", clock)
 	if err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("open temporary store: %w", err)
 	}
-	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
-	ids := platform.CryptoIDGenerator{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	plans := plan.New(stateStore, clock, ids)
-	nodes := fleet.New(stateStore, clock, ids)
-	allocations := allocation.New(stateStore, clock, ids)
-	probes := probe.New(stateStore, clock, ids, allocations)
-	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+	api := httpapi.New(services.plans, services.nodes, services.allocations, services.probes, services.assessments, platform.CryptoIDGenerator{}, logger)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -67,6 +88,7 @@ func newHarness() (*harness, error) {
 		server:   server,
 		listener: listener,
 		tempDir:  tempDir,
+		backing:  services,
 	}, nil
 }
 
@@ -76,6 +98,29 @@ func (h *harness) close() {
 	_ = h.server.Shutdown(ctx)
 	_ = h.listener.Close()
 	_ = os.RemoveAll(h.tempDir)
+}
+
+func (h *harness) statePath() string {
+	return h.tempDir + "/state.json"
+}
+
+// mutateSnapshot edits the persisted JSON snapshot directly, simulating
+// occupancy left on disk by an older service build or an abnormal shutdown.
+func (h *harness) mutateSnapshot(fn func(*domain.State)) error {
+	payload, err := os.ReadFile(h.statePath())
+	if err != nil {
+		return err
+	}
+	var state domain.State
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return err
+	}
+	fn(&state)
+	encoded, err := json.MarshalIndent(&state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(h.statePath(), append(encoded, '\n'), 0o600)
 }
 
 func (h *harness) call(method string, path string, requestBody any, target any) error {

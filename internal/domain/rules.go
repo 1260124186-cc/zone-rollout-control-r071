@@ -56,11 +56,12 @@ func LeaseFingerprint(planID string, input LeaseInput) string {
 // NodeClaimForLease derives the occupancy a committed lease takes on its node.
 func NodeClaimForLease(lease NodeLease) NodeClaim {
 	return NodeClaim{
-		NodeID:    lease.NodeID,
-		PlanID:    lease.PlanID,
-		LeaseID:   lease.ID,
-		ClaimedAt: lease.ClaimedAt.UTC(),
-		ExpiresAt: lease.ExpiresAt.UTC(),
+		NodeID:     lease.NodeID,
+		PlanID:     lease.PlanID,
+		RequestKey: "",
+		LeaseID:    lease.ID,
+		ClaimedAt:  lease.ClaimedAt.UTC(),
+		ExpiresAt:  lease.ExpiresAt.UTC(),
 	}
 }
 
@@ -81,6 +82,68 @@ func BuildClaimsFromLeases(leases map[string]NodeLease) map[string]NodeClaim {
 		claims[lease.NodeID] = NodeClaimForLease(lease)
 	}
 	return claims
+}
+
+// ExpireClaimedLeases marks claimed leases whose deadline has passed as
+// expired, returning the updated leases together with the node IDs whose
+// occupancy ended this way.
+func ExpireClaimedLeases(
+	leases map[string]NodeLease,
+	now time.Time,
+) (map[string]NodeLease, []string) {
+	freed := make([]string, 0)
+	for leaseID, lease := range leases {
+		if lease.State != LeaseClaimed || lease.ExpiresAt.After(now) {
+			continue
+		}
+		finishedAt := now.UTC()
+		lease.State = LeaseExpired
+		lease.FinishedAt = &finishedAt
+		leases[leaseID] = lease
+		freed = append(freed, lease.NodeID)
+	}
+	return leases, freed
+}
+
+// ReconcileOccupancy rebuilds node occupancy strictly from lease facts. Every
+// occupancy a request left behind without an accepted live lease is removed:
+//
+//   - claimed leases past their deadline are expired and release their nodes;
+//   - the node claim set is replaced by the projections of live claimed
+//     leases, so rejected requests can no longer block nodes;
+//   - a node marked leased without a live claim returns to ready, while a
+//     ready node that is in fact covered by a live claimed lease is marked
+//     leased; quarantined nodes are never touched.
+//
+// The number of occupancy records removed without a backing lease is
+// returned so callers can record the cleanup.
+func ReconcileOccupancy(state *State, now time.Time) int {
+	now = now.UTC()
+	liveLeases, _ := ExpireClaimedLeases(state.Leases, now)
+	liveClaims := BuildClaimsFromLeases(liveLeases)
+	orphaned := 0
+	for nodeID := range state.NodeClaims {
+		if _, covered := liveClaims[nodeID]; !covered {
+			orphaned++
+		}
+	}
+	state.NodeClaims = liveClaims
+	for nodeID, node := range state.Nodes {
+		_, occupied := liveClaims[nodeID]
+		switch {
+		case node.State == NodeLeased && !occupied:
+			node.State = NodeReady
+			node.Version++
+			node.UpdatedAt = now
+			state.Nodes[nodeID] = node
+		case node.State == NodeReady && occupied:
+			node.State = NodeLeased
+			node.Version++
+			node.UpdatedAt = now
+			state.Nodes[nodeID] = node
+		}
+	}
+	return orphaned
 }
 
 func ProbeFingerprint(leaseID string, input ProbeInput) string {
