@@ -50,11 +50,11 @@ func run() error {
 	}
 	defer lock.Unlock()
 
-	stateStore, err := store.Open(snapshotPath)
+	clock := platform.SystemClock{}
+	stateStore, err := store.Open(snapshotPath, clock.Now())
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	clock := platform.SystemClock{}
 	ids := platform.CryptoIDGenerator{}
 	plans := plan.New(stateStore, clock, ids)
 	nodes := fleet.New(stateStore, clock, ids)

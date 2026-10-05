@@ -119,9 +119,10 @@ func (s *Service) Submit(
 			node.UpdatedAt = now
 			state.Nodes[node.ID] = node
 		}
-		// The node is handed back once the report that closes the lease matches
-		// the request that took the occupancy.
-		if claim, claimed := state.NodeClaims[node.ID]; claimed && claim.RequestKey == input.RequestKey {
+		// The first valid report closes the lease, so whatever occupancy it held
+		// on the node ends here. Probe request keys are independent of lease
+		// request keys and must not gate releasing the node.
+		if claim, claimed := state.NodeClaims[node.ID]; claimed && claim.LeaseID == leaseID {
 			delete(state.NodeClaims, node.ID)
 		}
 		store.AddAudit(state, s.ids, "probe", result.ID, "stored", now, map[string]any{

@@ -24,6 +24,9 @@ func normalize(state domain.State) domain.State {
 	if state.Leases == nil {
 		state.Leases = make(map[string]domain.NodeLease)
 	}
+	if state.NodeClaims == nil {
+		state.NodeClaims = make(map[string]domain.NodeClaim)
+	}
 	if state.LeaseGroups == nil {
 		state.LeaseGroups = make(map[string]domain.LeaseGroup)
 	}

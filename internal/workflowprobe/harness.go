@@ -36,12 +36,12 @@ func newHarness() (*harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temporary directory: %w", err)
 	}
-	stateStore, err := store.Open(tempDir + "/state.json")
+	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
+	stateStore, err := store.Open(tempDir+"/state.json", clock.Now())
 	if err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("open temporary store: %w", err)
 	}
-	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
 	ids := platform.CryptoIDGenerator{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	plans := plan.New(stateStore, clock, ids)

@@ -83,6 +83,85 @@ func BuildClaimsFromLeases(leases map[string]NodeLease) map[string]NodeClaim {
 	return claims
 }
 
+// ExpireOccupancy marks claimed leases whose deadline has passed as expired,
+// returns their nodes to ready and drops their occupancy records.
+func ExpireOccupancy(state *State, now time.Time) int {
+	count := 0
+	now = now.UTC()
+	for leaseID, lease := range state.Leases {
+		if lease.State != LeaseClaimed || lease.ExpiresAt.After(now) {
+			continue
+		}
+		finishedAt := now
+		lease.State = LeaseExpired
+		lease.FinishedAt = &finishedAt
+		state.Leases[leaseID] = lease
+		if node, ok := state.Nodes[lease.NodeID]; ok && node.State == NodeLeased {
+			node.State = NodeReady
+			node.Version++
+			node.UpdatedAt = now
+			state.Nodes[node.ID] = node
+		}
+		if claim, claimed := state.NodeClaims[lease.NodeID]; claimed && claim.LeaseID == leaseID {
+			delete(state.NodeClaims, lease.NodeID)
+		}
+		count++
+	}
+	return count
+}
+
+// ReconcileOccupancy rebuilds every occupancy observation from lease truth.
+// Due leases expire first; the claim set is then rebuilt strictly from live
+// claimed leases and node states are repaired to match it. Occupancy left
+// behind by requests that were never accepted (claims or leased nodes without
+// a claimed lease) is removed, while leases that are still claimed keep
+// holding their nodes. Quarantined nodes are left in quarantine. It reports
+// whether the state changed.
+func ReconcileOccupancy(state *State, now time.Time) bool {
+	changed := ExpireOccupancy(state, now) > 0
+	now = now.UTC()
+
+	live := BuildClaimsFromLeases(state.Leases)
+	if state.NodeClaims == nil {
+		state.NodeClaims = make(map[string]NodeClaim)
+	}
+	for nodeID := range state.NodeClaims {
+		if _, ok := live[nodeID]; !ok {
+			delete(state.NodeClaims, nodeID)
+			changed = true
+		}
+	}
+	for nodeID, claim := range live {
+		existing, ok := state.NodeClaims[nodeID]
+		if !ok || existing != claim {
+			state.NodeClaims[nodeID] = claim
+			changed = true
+		}
+	}
+
+	for nodeID, node := range state.Nodes {
+		if node.State == NodeQuarantined {
+			continue
+		}
+		_, occupied := live[nodeID]
+		switch {
+		case occupied && node.State != NodeLeased:
+			node.State = NodeLeased
+			node.Version++
+			node.UpdatedAt = now
+			state.Nodes[nodeID] = node
+			changed = true
+		case !occupied && node.State != NodeReady:
+			node.State = NodeReady
+			node.Version++
+			node.UpdatedAt = now
+			state.Nodes[nodeID] = node
+			changed = true
+		}
+	}
+	return changed
+}
+
 func ProbeFingerprint(leaseID string, input ProbeInput) string {
 	payload := fmt.Sprintf(
 		"%s|%s|%t|%d|%d|%s",

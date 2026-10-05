@@ -19,11 +19,12 @@ type Store struct {
 	state domain.State
 }
 
-func Open(path string) (*Store, error) {
+func Open(path string, now time.Time) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("snapshot path is required")
 	}
 	state := blankState()
+	loaded := false
 	payload, err := os.ReadFile(path)
 	switch {
 	case err == nil:
@@ -31,6 +32,7 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("decode snapshot: %w", err)
 		}
 		state = normalize(state)
+		loaded = true
 	case errors.Is(err, os.ErrNotExist):
 		if err := replaceFile(path, state); err != nil {
 			return nil, fmt.Errorf("initialize snapshot: %w", err)
@@ -38,19 +40,14 @@ func Open(path string) (*Store, error) {
 	default:
 		return nil, fmt.Errorf("read snapshot: %w", err)
 	}
-	rebuildNodeClaims(&state)
+	// Judge occupancy from lease truth on boot and flush the cleanup, so
+	// occupancy stranded by rejected requests cannot survive a restart.
+	if domain.ReconcileOccupancy(&state, now.UTC()) && loaded {
+		if err := replaceFile(path, state); err != nil {
+			return nil, fmt.Errorf("persist reconciled snapshot: %w", err)
+		}
+	}
 	return &Store{path: path, state: state}, nil
-}
-
-// rebuildNodeClaims merges the occupancy carried by live leases into the
-// persisted node claim set when a snapshot is loaded.
-func rebuildNodeClaims(state *domain.State) {
-	if state.NodeClaims == nil {
-		state.NodeClaims = make(map[string]domain.NodeClaim)
-	}
-	for nodeID, claim := range domain.BuildClaimsFromLeases(state.Leases) {
-		state.NodeClaims[nodeID] = claim
-	}
 }
 
 func (s *Store) Path() string {
